@@ -2,6 +2,7 @@ import json
 import io
 import pandas as pd
 import logging
+import html
 from aiogram import Router, F, Bot, types
 from aiogram.types import Message, CallbackQuery, BufferedInputFile
 from aiogram.fsm.context import FSMContext
@@ -43,16 +44,22 @@ def repair_truncated_json(json_str: str) -> str:
 def format_verdict_text(raw_json: str) -> str:
     try:
         clean_json = raw_json.strip()
+        
+        # 1. Покращена екстракція JSON (шукаємо межі фігурних дужок)
         if "```json" in clean_json:
             clean_json = clean_json.split("```json")[1].split("```")[0]
         elif "```" in clean_json:
             clean_json = clean_json.split("```")[1].split("```")[0]
 
         start_idx = clean_json.find('{')
-        if start_idx == -1:
-            return f"💬 **Звіт Агента (текстовий формат):**\n\n{raw_json}"
+        end_idx = clean_json.rfind('}')
+        
+        if start_idx == -1 or end_idx == -1:
+            # Якщо JSON не знайдено, екрануємо весь текст, щоб не зламати HTML
+            safe_raw = html.escape(raw_json)
+            return f"💬 <b>Звіт Агента (текстовий формат):</b>\n\n{safe_raw}"
 
-        json_part = clean_json[start_idx:]
+        json_part = clean_json[start_idx:end_idx+1]
         
         try:
             data = json.loads(json_part)
@@ -63,32 +70,38 @@ def format_verdict_text(raw_json: str) -> str:
                 data = json.loads(repaired)
                 is_truncated = True
             except:
-                return f"⚠️ **Критична помилка JSON:**\nДані занадто пошкоджені для аналізу.\n\n`{raw_json[:300]}...`"
+                safe_snippet = html.escape(raw_json[:300])
+                return f"⚠️ <b>Критична помилка JSON:</b>\nДані занадто пошкоджені.\n\n<code>{safe_snippet}...</code>"
+
+        # 2. Підготовка даних (безпечне отримання та екранування)
+        def s(value): # Скорочена функція для безпечного тексту
+            return html.escape(str(value))
 
         color_map = {"ЗЕЛЕНИЙ": "🟢", "ЖОВТИЙ": "🟡", "ЧЕРВОНИЙ": "🔴"}
         status_emoji = color_map.get(str(data.get('колір', '')).upper(), "⚪️")
 
+        # 3. Формування HTML тексту
         text = (
-            f"{status_emoji} **ВЕРДИКТ: {data.get('вердикт', 'АНАЛІЗ ЗАВЕРШЕНО')}**\n"
-            f"📅 {data.get('timestamp', 'дата не вказана')}\n"
+            f"{status_emoji} <b>ВЕРДИКТ: {s(data.get('вердикт', 'АНАЛІЗ ЗАВЕРШЕНО'))}</b>\n"
+            f"📅 {s(data.get('timestamp', 'дата не вказана'))}\n"
             f"━━━━━━━━━━━━━━━━━━━━\n\n"
         )
 
         # Секція замовлення
         zamov = data.get('замовлення', {})
         text += (
-            f"📦 **Замовлення:** {zamov.get('SKU', 'Н/Д')}\n"
-            f"⚖️ **Обсяг:** {zamov.get('обсяг_кг', 0)} кг\n"
-            f"⏰ **Дедлайн:** {zamov.get('дедлайн_відвантаження', 'Н/Д')}\n\n"
+            f"📦 <b>Замовлення:</b> {s(zamov.get('SKU', 'Н/Д'))}\n"
+            f"⚖️ <b>Обсяг:</b> {s(zamov.get('обсяг_кг', 0))} кг\n"
+            f"⏰ <b>Дедлайн:</b> {s(zamov.get('дедлайн_відвантаження', 'Н/Д'))}\n\n"
         )
 
         # Секція сировини
         if data.get('сировинний_баланс'):
-            text += "🧱 **Сировинний баланс:**\n"
+            text += "<b>🧱 Сировинний баланс:</b>\n"
             for item in data['сировинний_баланс']:
-                nom = item.get('номенклатура', 'Невідомо')
-                bal = item.get('баланс', 0)
-                unit = item.get('одиниця', 'кг')
+                nom = s(item.get('номенклатура', 'Невідомо'))
+                bal = s(item.get('баланс', 0))
+                unit = s(item.get('одиниця', 'кг'))
                 st = item.get('статус', '')
                 
                 icon = "✅" if st == "профіцит" else ("⚠️" if st == "в нуль" else "❌")
@@ -97,27 +110,31 @@ def format_verdict_text(raw_json: str) -> str:
 
         # Обладнання
         if data.get('завантаженість_обладнання'):
-            text += "⚙️ **Обладнання:**\n"
+            text += "<b>⚙️ Обладнання:</b>\n"
             for eq in data['завантаженість_обладнання']:
                 eq_st = eq.get('статус', '')
                 eq_icon = "🟢" if eq_st == "вільно" else ("🟡" if eq_st == "напружено" else "🔴")
-                text += f"{eq_icon} {eq.get('обладнання')}: {eq.get('вільний_час_год', 0)}г вільно\n"
+                text += f"{eq_icon} {s(eq.get('обладнання'))}: {s(eq.get('вільний_час_год', 0))}г вільно\n"
             text += "\n"
 
-        # Рекомендації та обґрунтування
-        text += f"📝 **Обґрунтування:**\n{data.get('обґрунтування', 'Аналіз проведено на основі наявних залишків та норм виробництва.')}\n\n"
+        # Рекомендації
+        obs = s(data.get('обґрунтування', 'Аналіз проведено на основі наявних залишків.'))
+        text += f"📝 <b>Обґрунтування:</b>\n{obs}\n\n"
         
         if data.get('умови_виконання'):
-            text += "💡 **Умови:**\n• " + "\n• ".join(data['умови_виконання']) + "\n\n"
+            text += "<b>💡 Умови:</b>\n"
+            for u in data['умови_виконання']:
+                text += f"• {s(u)}\n"
+            text += "\n"
 
         if is_truncated:
-            text += "⚠️ **УВАГА:** Звіт було обірвано через ліміт токенів. Деякі дані можуть бути відсутні."
+            text += "⚠️ <b>УВАГА:</b> Звіт було обірвано через ліміт токенів."
 
         return text
 
     except Exception as e:
         logger.error(f"Помилка форматування тексту: {e}")
-        return f"❌ **Сталася помилка при обробці звіту.**\n\nТехнічні деталі: `{str(e)}`"
+        return f"❌ <b>Сталася помилка при обробці звіту.</b>\n\nТехнічні деталі: <code>{s(str(e))}</code>"
 
 # --- БД І ЛОГІКА ЗБЕРЕЖЕННЯ ---
 async def save_results_to_db(user_id: int, results: dict):
@@ -197,11 +214,11 @@ async def handle_document_analysis(message: Message, bot: Bot):
             try: content = raw_data.decode('utf-8-sig')
             except: content = raw_data.decode('cp1251')
 
-        results = await pipeline.run(content)
+        results = await pipeline.run(content, status_msg=status_msg)
         await save_results_to_db(message.from_user.id, results)
         
         readable_text = format_verdict_text(results.get('verdict', "{}"))
-        await status_msg.edit_text(readable_text, parse_mode="Markdown")
+        await status_msg.edit_text(readable_text, parse_mode="HTML")
         
         await send_agent_reports(message, results)
         
@@ -215,11 +232,11 @@ async def handle_text_analysis(message: Message):
     
     status_msg = await message.answer("🤖 Агенти вивчають запит...")
     try:
-        results = await pipeline.run(message.text)
+        results = await pipeline.run(message.text, status_msg=status_msg)
         await save_results_to_db(message.from_user.id, results)
         
         readable_text = format_verdict_text(results.get('verdict', "{}"))
-        await status_msg.edit_text(readable_text, parse_mode="Markdown")
+        await status_msg.edit_text(readable_text, parse_mode="HTML")
         
         await send_agent_reports(message, results)
     except Exception as e:

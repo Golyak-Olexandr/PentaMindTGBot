@@ -30,7 +30,6 @@ class BaseAgent:
         self.model = genai.GenerativeModel('gemini-2.5-flash', system_instruction=role)
 
     async def call_llm(self, user_input: str, context: str = "", db_data: str = "", semaphore: asyncio.Semaphore = None):
-        """Виклик LLM з обробкою помилок та автоматичними ретраями."""
         full_prompt = (
             f"### ГОЛОВНЕ ЗАВДАННЯ ДЛЯ ВИКОНАННЯ:\n{user_input}\n\n"
             f"Твоя роль: {self.role}\n\n"
@@ -78,7 +77,6 @@ class AnalysisPipeline:
         self.request_history = []
 
     async def _wait_for_quota(self):
-        """Контролює дотримання ліміту 5 запитів на хвилину."""
         now = time.time()
         self.request_history = [t for t in self.request_history if now - t < 60]
         
@@ -91,7 +89,6 @@ class AnalysisPipeline:
         self.request_history.append(time.time())
 
     async def fetch_formatted_db(self):
-        """Збирає дані з БД та готує їх у Markdown форматі."""
         async with async_session_local() as session:
             try:
                 raw_res = (await session.execute(text("SELECT location, name, unit, quantity FROM inventory_raw"))).all()
@@ -117,8 +114,7 @@ class AnalysisPipeline:
                 logger.error(f"Помилка БД: {e}")
                 return {"raw": "", "semi": "", "spec": "", "rate": ""}
 
-    async def run(self, input_data: str):
-        """Запуск повного циклу аналізу з рівномірними паузами."""
+    async def run(self, input_data: str, status_msg=None): 
         start_time = time.time()
         current_time_str = datetime.now().strftime("%Y-%m-%d %H:%M")
         
@@ -126,45 +122,51 @@ class AnalysisPipeline:
         if not input_data:
             return {"verdict": "Помилка: вхідні дані порожні."}
 
-        # КРОК 1
-        print("--- Агент 1 аналізує склад... ---")
-        res1 = await self.agent1.call_llm(input_data, db_data=db['raw'] + db['spec'], semaphore=self.semaphore)
+        # КРОК 1 та 2
+        msg = "Етап 1: Аі-агенти 1 та 2 розпочали паралельний аналіз..."
+        print(f"\n{msg}")
+        if status_msg:
+            await status_msg.edit_text(f"<b>{msg}</b>", parse_mode="HTML")
         
-        # Рівномірна пауза 15с між агентами (60с / 4 запити = 15с)
-        print("--- Передишка для заходу в межі RPM ---")
-        await asyncio.sleep(15)
+        task1 = self.agent1.call_llm(input_data, db_data=db['raw'] + db['spec'], semaphore=self.semaphore)
+        task2 = self.agent2.call_llm(input_data, db_data=db['semi'] + db['spec'] + db['rate'], semaphore=self.semaphore)
         
-        # КРОК 2
-        print("--- Агент 2 аналізує напівфабрикати... ---")
-        res2 = await self.agent2.call_llm(input_data, db_data=db['semi'] + db['spec'] + db['rate'], semaphore=self.semaphore)
-
-        print("--- Передишка для заходу в межі RPM ---")
-        await asyncio.sleep(15)
-
+        res1, res2 = await asyncio.gather(task1, task2)
+        await asyncio.sleep(10)
+        
         # КРОК 3
-        print("--- Агент 3 формує план... ---")
+        msg = "Етап 2: Аі-агент 3 формує чергу та план..."
+        print(f"{msg}")
+        if status_msg:
+            await status_msg.edit_text(f"<b>{msg}</b>", parse_mode="HTML")
+            
         a3_context = f"Звіт Складу (А1): {res1}\nЗвіт НЗВ (А2): {res2}"
         res3 = await self.agent3.call_llm(input_data, context=a3_context, db_data=db['spec'] + db['rate'], semaphore=self.semaphore)
 
-        # Перевірка загального часу (умова: пауза після А3, якщо пройшло мало часу)
+        # Очікування RPM
         elapsed = time.time() - start_time
         if elapsed < 60:
             wait_for_rest = 60 - elapsed + 2
-            print(f"⏳ Пауза після А3: пройшло лише {elapsed:.1f}с. Чекаємо {wait_for_rest:.1f}с для оновлення токенів...")
+            print(f"[SYSTEM] RPM Limit: Чекаємо {wait_for_rest:.1f}с...")
+            if status_msg:
+                await status_msg.edit_text(f"⏳ Очікуємо ліміти API ({int(wait_for_rest)}с)...", parse_mode="HTML")
             await asyncio.sleep(wait_for_rest)
 
-        print("--- Передишка для заходу в межі RPM ---")
-        await asyncio.sleep(15)
-
         # КРОК 4
-        print("--- Агент 4 рахує таймінги... ---")
+        msg = "Етап 3: Аі-агент 4 розраховує таймінги..."
+        print(f"{msg}")
+        if status_msg:
+            await status_msg.edit_text(f"<b>{msg}</b>", parse_mode="HTML")
+            
         res4 = await self.agent4.call_llm(res3, context=f"НЗВ: {res2}", db_data=db['raw']+db['semi']+db['spec']+db['rate'], semaphore=self.semaphore)
-
-        print("--- Передишка для заходу в межі RPM ---")
-        await asyncio.sleep(15)
+        await asyncio.sleep(10)
 
         # КРОК 5
-        print("--- Агент 5 формує вердикт... ---")
+        msg = "Фінал: Аі-агент 5 виносить вердикт..."
+        print(f" {msg}")
+        if status_msg:
+            await status_msg.edit_text(f"<b>{msg}</b>", parse_mode="HTML")
+            
         final_context = (
             f"ПОТОЧНИЙ ЧАС: {current_time_str}\n"
             f"ЗАПИТ: {input_data}\n\n"
@@ -173,6 +175,7 @@ class AnalysisPipeline:
         )
         res5 = await self.agent5.call_llm("ВИКОНАЙ ФІНАЛЬНИЙ АНАЛІЗ", context=final_context, semaphore=self.semaphore)
 
+        print("Аналіз успішно завершено.\n")
         return {
             "md1": res1, "md2": res2, "md3": res3, "md4": res4, "verdict": res5
         }

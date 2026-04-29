@@ -33,6 +33,8 @@ GO
 */
 
 -- 1. Залишки сировини
+IF OBJECT_ID('inventory_raw', 'U') IS NULL
+BEGIN
 CREATE TABLE inventory_raw (
     id INT IDENTITY(1,1) PRIMARY KEY,
     location NVARCHAR(255),
@@ -41,8 +43,11 @@ CREATE TABLE inventory_raw (
     quantity DECIMAL(15, 3),
     created_at DATETIME DEFAULT GETDATE()
 );
+END
 
 -- 2. Залишки напівфабрикатів
+IF OBJECT_ID('inventory_semi', 'U') IS NULL
+BEGIN
 CREATE TABLE inventory_semi (
     id INT IDENTITY(1,1) PRIMARY KEY,
     location NVARCHAR(255),
@@ -51,8 +56,11 @@ CREATE TABLE inventory_semi (
     quantity DECIMAL(15, 3),
     updated_at DATETIME DEFAULT GETDATE()
 );
+END
 
 -- 3. Специфікації
+IF OBJECT_ID('specifications', 'U') IS NULL
+BEGIN
 CREATE TABLE specifications (
     id INT IDENTITY(1,1) PRIMARY KEY,
     parent_product NVARCHAR(255),
@@ -60,8 +68,11 @@ CREATE TABLE specifications (
     norm DECIMAL(15, 5),
     created_at DATETIME DEFAULT GETDATE()
 );
+END
 
 -- 4. Продуктивність
+IF OBJECT_ID('production_rates', 'U') IS NULL
+BEGIN
 CREATE TABLE production_rates (
     id INT IDENTITY(1,1) PRIMARY KEY,
     op_order INT,
@@ -71,6 +82,7 @@ CREATE TABLE production_rates (
     rate DECIMAL(15, 3),
     created_at DATETIME DEFAULT GETDATE()
 );
+END
 GO
 
 
