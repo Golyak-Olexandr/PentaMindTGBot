@@ -1,181 +1,108 @@
 import asyncio
 import logging
+from openai import AsyncOpenAI, RateLimitError, OpenAIError
 import time
 from datetime import datetime
-from sqlalchemy import text
-import google.generativeai as genai
-from google.api_core import exceptions
-
-from db.engine import async_session_local
 from config import Config
-from services.prompts import (
-    AGENT_1_PROMPT, 
-    AGENT_2_PROMPT, 
-    AGENT_3_PROMPT, 
-    AGENT_4_PROMPT, 
-    AGENT_5_PROMPT
-)
+from services.prompts import AGENT_5_PROMPT
+from services.deterministic_agents import run_deterministic_pipeline
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-genai.configure(api_key=Config.GEMINI_KEY)
-
+client = AsyncOpenAI(api_key=Config.OPENAI_KEY)
 class BaseAgent:
     def __init__(self, name: str, role: str):
-        
         self.name = name
         self.role = role
-        # ЗМІНЮВАТИ МОДЕЛЬ АІ-АГЕНТІВ ТУТ
-        self.model = genai.GenerativeModel('gemini-2.5-flash', system_instruction=role)
+        self.model_name = "gpt-5.4-mini"
 
-    async def call_llm(self, user_input: str, context: str = "", db_data: str = "", semaphore: asyncio.Semaphore = None):
-        full_prompt = (
-            f"### ГОЛОВНЕ ЗАВДАННЯ ДЛЯ ВИКОНАННЯ:\n{user_input}\n\n"
-            f"Твоя роль: {self.role}\n\n"
+    async def call_llm(self, user_input: str, context: str = "", semaphore: asyncio.Semaphore = None):
+        full_input = (
+            f"SYSTEM ROLE: {self.role}\n\n"
+            f"### ЗАВДАННЯ:\n{user_input}\n\n"
+            f"### КОНТЕКСТ (JSON):\n{context}\n\n"
+            "Сформуй відповідь строго у форматі JSON. "
+            "Якщо в назвах є лапки (\"), замінюй їх на одинарні (\')."
         )
-        
-        if db_data:
-            full_prompt += f"--- ТВОЯ БАЗА ЗНАНЬ (ДАНІ З БД) ---\n{db_data}\n\n"
-            
-        if context:
-            full_prompt += f"--- КОНТЕКСТ ВІД ІНШИХ АГЕНТІВ ---\n{context}\n\n"
-            
-        full_prompt += "\nСформуй чітку відповідь згідно з твоїм форматом. Якщо в назвах є лапки (\"), замінюй їх на одинарні (')."
 
         async with (semaphore or asyncio.Lock()):
-            for attempt in range(3):
+            max_attempts = 2
+            for current_attempt in range(max_attempts):
                 try:
-                    response = await self.model.generate_content_async(
-                        full_prompt,
+                    response = await client.responses.create(
+                        model=self.model_name,
+                        input=full_input,
+                        store=True,
                     )
-                    if not response.text:
+                    
+                    if not response.output_text:
                         return f"Агент {self.name} повернув порожню відповідь."
-                    return response.text
+                    
+                    return response.output_text
 
-                except exceptions.ResourceExhausted:
-                    wait_time = 30 * (attempt + 1)
-                    logger.warning(f"⚠️ Агент {self.name}: Ліміт 429! Спроба {attempt+1}/3. Чекаємо {wait_time}с...")
-                    await asyncio.sleep(wait_time)
-                
+                except RateLimitError:
+                    if current_attempt < max_attempts - 1:
+                        wait_time = 2
+                        logger.warning(f"⚠️ Агент {self.name}: 429 (Rate Limit), спроба {current_attempt + 1}")
+                        await asyncio.sleep(wait_time)
+                        continue
+                    return "ПОМИЛКА: Ліміти OpenAI вичерпано (429). Спробуйте пізніше."
+
+                except OpenAIError as e:
+                    logger.error(f"❌ Помилка OpenAI у агента {self.name}: {e}")
+                    return f"Внутрішня помилка API: {str(e)}"
+
                 except Exception as e:
-                    logger.error(f"❌ Агент {self.name} помилка: {str(e)}")
-                    return f"Внутрішня помилка агента {self.name}."
-
-            return "ПОМИЛКА: Не вдалося отримати відповідь після кількох спроб через ліміти API."
-
+                    logger.error(f"❌ Непередбачена помилка агента {self.name}: {e}")
+                    return f"Помилка: {str(e)}"
+            
+            return "ПОМИЛКА: Не вдалося отримати відповідь від OpenAI."
+        
 class AnalysisPipeline:
     def __init__(self):
-        self.agent1 = BaseAgent("Склад", AGENT_1_PROMPT)
-        self.agent2 = BaseAgent("НЗВ", AGENT_2_PROMPT)
-        self.agent3 = BaseAgent("Замовлення", AGENT_3_PROMPT)
-        self.agent4 = BaseAgent("Аналітик", AGENT_4_PROMPT)
         self.agent5 = BaseAgent("Арбітр", AGENT_5_PROMPT)
-        
-        # Обмежуємо кількість одночасних запитів до мережі
         self.semaphore = asyncio.Semaphore(1)
-        self.request_history = []
 
-    async def _wait_for_quota(self):
-        now = time.time()
-        self.request_history = [t for t in self.request_history if now - t < 60]
-        
-        if len(self.request_history) >= 4:
-            wait_time = 60 - (now - self.request_history[0]) + 2
-            if wait_time > 0:
-                logger.info(f"⏳ RPM ліміт! Пауза {wait_time:.1f} сек...")
-                await asyncio.sleep(wait_time)
-        
-        self.request_history.append(time.time())
-
-    async def fetch_formatted_db(self):
-        async with async_session_local() as session:
-            try:
-                raw_res = (await session.execute(text("SELECT location, name, unit, quantity FROM inventory_raw"))).all()
-                semi_res = (await session.execute(text("SELECT location, name, unit, quantity FROM inventory_semi"))).all()
-                spec_res = (await session.execute(text("SELECT parent_product, ingredient, norm FROM specifications"))).all()
-                rate_res = (await session.execute(text("SELECT op_name, input_item, output_item, rate FROM production_rates"))).all()
-                
-                logger.info(f"DB Fetch: Raw:{len(raw_res)}, Semi:{len(semi_res)}, Specs:{len(spec_res)}")
-
-                def to_md(rows, headers):
-                    if not rows: return "Дані відсутні.\n"
-                    table = f"| {' | '.join(headers)} |\n| {' | '.join(['---']*len(headers))} |\n"
-                    for r in rows:
-                        table += f"| {' | '.join([str(val) for val in r])} |\n"
-                    return table
-                return {
-                    "raw": "### 📦 СКЛАД СИРОВИНИ\n" + to_md(raw_res, ["Місце", "Назва", "Од", "К-сть"]),
-                    "semi": "### 🏭 ЗАЛИШКИ НЗВ\n" + to_md(semi_res, ["Місце", "Назва", "Од", "К-сть"]),
-                    "spec": "### 📜 СПЕЦИФІКАЦІЇ\n" + to_md(spec_res, ["Продукт", "Інгредієнт", "Норма"]),
-                    "rate": "### ⚙️ ПРОДУКТИВНІСТЬ\n" + to_md(rate_res, ["Операція", "Вхід", "Вихід", "Швидкість"])
-                }
-            except Exception as e:
-                logger.error(f"Помилка БД: {e}")
-                return {"raw": "", "semi": "", "spec": "", "rate": ""}
-
-    async def run(self, input_data: str, status_msg=None): 
+    async def run(self, input_data: str | bytes, filename: str = "", status_msg=None, send_func=None) -> dict:
         start_time = time.time()
         current_time_str = datetime.now().strftime("%Y-%m-%d %H:%M")
-        
-        db = await self.fetch_formatted_db()
+
         if not input_data:
             return {"verdict": "Помилка: вхідні дані порожні."}
 
-        # КРОК 1 та 2
-        msg = "Етап 1: Аі-агенти 1 та 2 розпочали паралельний аналіз..."
-        print(f"\n{msg}")
         if status_msg:
-            await status_msg.edit_text(f"<b>{msg}</b>", parse_mode="HTML")
-        
-        task1 = self.agent1.call_llm(input_data, db_data=db['raw'] + db['spec'], semaphore=self.semaphore)
-        task2 = self.agent2.call_llm(input_data, db_data=db['semi'] + db['spec'] + db['rate'], semaphore=self.semaphore)
-        
-        res1, res2 = await asyncio.gather(task1, task2)
-        await asyncio.sleep(10)
-        
-        # КРОК 3
-        msg = "Етап 2: Аі-агент 3 формує чергу та план..."
-        print(f"{msg}")
-        if status_msg:
-            await status_msg.edit_text(f"<b>{msg}</b>", parse_mode="HTML")
-            
-        a3_context = f"Звіт Складу (А1): {res1}\nЗвіт НЗВ (А2): {res2}"
-        res3 = await self.agent3.call_llm(input_data, context=a3_context, db_data=db['spec'] + db['rate'], semaphore=self.semaphore)
+            await status_msg.edit_text("<b>Етап 1: Детермінований аналіз...</b>", parse_mode="HTML")
 
-        # Очікування RPM
-        elapsed = time.time() - start_time
-        if elapsed < 60:
-            wait_for_rest = 60 - elapsed + 2
-            print(f"[SYSTEM] RPM Limit: Чекаємо {wait_for_rest:.1f}с...")
-            if status_msg:
-                await status_msg.edit_text(f"⏳ Очікуємо ліміти API ({int(wait_for_rest)}с)...", parse_mode="HTML")
-            await asyncio.sleep(wait_for_rest)
+        if isinstance(input_data, bytes):
+            try:
+                res1, res2, res3, res4, agent5_context, _ = await run_deterministic_pipeline(
+                    input_data, filename, current_time_str
+                )
+                
+                if send_func:
+                    await send_func(res1, "📦_Склад.md")
+                    await send_func(res2, "🏭_НЗВ.md")
+                    await send_func(res3, "📜_План.md")
+                    await send_func(res4, "📊_Таймінги.md")
 
-        # КРОК 4
-        msg = "Етап 3: Аі-агент 4 розраховує таймінги..."
-        print(f"{msg}")
-        if status_msg:
-            await status_msg.edit_text(f"<b>{msg}</b>", parse_mode="HTML")
-            
-        res4 = await self.agent4.call_llm(res3, context=f"НЗВ: {res2}", db_data=db['raw']+db['semi']+db['spec']+db['rate'], semaphore=self.semaphore)
-        await asyncio.sleep(10)
+            except ValueError as e:
+                error_msg = f"❌ Помилка формату файлу: {e}"
+                if status_msg:
+                    await status_msg.edit_text(error_msg)
+                return {"verdict": error_msg}
+        else:
+            logger.warning("Текстовий вхід: детермінований аналіз пропущено")
+            res1 = res2 = res3 = res4 = "⚠️ Excel не надано — детермінований аналіз пропущено."
+            agent5_context = input_data
 
-        # КРОК 5
-        msg = "Фінал: Аі-агент 5 виносить вердикт..."
-        print(f" {msg}")
         if status_msg:
-            await status_msg.edit_text(f"<b>{msg}</b>", parse_mode="HTML")
-            
-        final_context = (
-            f"ПОТОЧНИЙ ЧАС: {current_time_str}\n"
-            f"ЗАПИТ: {input_data}\n\n"
-            f"ЗВІТ_А1: {res1}\n\nЗВІТ_А2: {res2}\n\n"
-            f"ЗВІТ_А3: {res3}\n\nЗВІТ_А4: {res4}"
+            await status_msg.edit_text("<b>Фінал: Агент 5 виносить вердикт...</b>", parse_mode="HTML")
+
+        res5 = await self.agent5.call_llm(
+            "ВИКОНАЙ ФІНАЛЬНИЙ АНАЛІЗ",
+            context=agent5_context,
+            semaphore=self.semaphore,
         )
-        res5 = await self.agent5.call_llm("ВИКОНАЙ ФІНАЛЬНИЙ АНАЛІЗ", context=final_context, semaphore=self.semaphore)
 
-        print("Аналіз успішно завершено.\n")
-        return {
-            "md1": res1, "md2": res2, "md3": res3, "md4": res4, "verdict": res5
-        }
+        logger.info("Аналіз завершено.")
+        return {"md1": res1, "md2": res2, "md3": res3, "md4": res4, "verdict": res5}

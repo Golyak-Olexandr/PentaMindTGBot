@@ -6,4 +6,4 @@ load_dotenv()
 class Config:
     BOT_TOKEN = os.getenv("BOT_TOKEN")
     DB_URL = os.getenv("DB_URL")
-    GEMINI_KEY = os.getenv("GEMINI_KEY")
+    OPENAI_KEY = os.getenv("OPENAI_KEY")

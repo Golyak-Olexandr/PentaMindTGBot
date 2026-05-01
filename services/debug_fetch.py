@@ -11,7 +11,6 @@ async def debug_db():
     print("🚀 Починаю витягувати дані з БД...")
     try:
         async with async_session_local() as session:
-            # 1. Запити
             raw_res = (await session.execute(text("SELECT location, name, unit, quantity FROM inventory_raw"))).all()
             semi_res = (await session.execute(text("SELECT location, name, unit, quantity FROM inventory_semi"))).all()
             spec_res = (await session.execute(text("SELECT parent_product, ingredient, norm FROM specifications"))).all()
@@ -23,14 +22,12 @@ async def debug_db():
                     table += f"| {' | '.join([str(val) for val in r])} |\n"
                 return table
 
-            # Формуємо блоки
             raw_md = to_md(raw_res, ["Місце", "Назва", "Од", "К-сть"])
             semi_md = to_md(semi_res, ["Місце", "Назва", "Од", "К-сть"])
             spec_md = to_md(spec_res, ["Продукт", "Інгредієнт", "Норма"])
             
-            # --- ВИВІД РЕЗУЛЬТАТІВ ---
             print("\n=== [ СКЛАД СИРОВИНИ ] ===")
-            print(raw_md[:1000] + ("\n...далі ще багато тексту..." if len(raw_md) > 1000 else ""))
+            print(raw_md[:2000] + ("\n...далі ще багато тексту..." if len(raw_md) > 1000 else ""))
             
             print("\n=== [ СУМАРНА ВАГА КОНТЕКСТУ ] ===")
             print(f"📦 Склад: {len(raw_md)} симв.")
